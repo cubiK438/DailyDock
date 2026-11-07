@@ -11,6 +11,18 @@ VALID_ENVIRONMENTS = {"development", "production", "test"}
 VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 SENSITIVE_FIELD_NAMES = {"password", "token", "secret", "key", "api_key", "credential"}
 
+# Canonical root directory of the DailyDock repository
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _resolve_data_dir(data_dir: Path) -> Path:
+    """Resolve relative data directories from the repository root, not the current directory."""
+    data_dir = data_dir.expanduser()
+    if not data_dir.is_absolute():
+        data_dir = PROJECT_ROOT / data_dir
+    return data_dir.resolve()
+
 
 def _load_env_file(dotenv_path: Optional[Path] = None) -> None:
     """Load key-value pairs from a .env file into os.environ without third-party dependencies.
@@ -29,7 +41,7 @@ def _load_env_file(dotenv_path: Optional[Path] = None) -> None:
             cwd / ".env",
             cwd / "backend" / ".env",
             Path(__file__).resolve().parent.parent / ".env",
-            Path(__file__).resolve().parent.parent.parent / ".env",
+            PROJECT_ROOT / ".env",
         ])
 
     target_file = None
@@ -119,6 +131,55 @@ class Settings:
         )
     )
 
+    # Database and Persistent Storage Configuration
+    data_dir: Path = field(
+        default_factory=lambda: _resolve_data_dir(
+            Path(os.getenv("DAILYDOCK_DATA_DIR", str(DEFAULT_DATA_DIR)))
+        )
+    )
+    database_url: str = field(
+        default_factory=lambda: os.getenv(
+            "DAILYDOCK_DATABASE_URL",
+            f"sqlite+aiosqlite:///{_resolve_data_dir(Path(os.getenv('DAILYDOCK_DATA_DIR', str(DEFAULT_DATA_DIR)))) / 'dailydock.db'}",
+        )
+    )
+    database_echo: bool = field(
+        default_factory=lambda: os.getenv(
+            "DAILYDOCK_DATABASE_ECHO", "false"
+        ).lower()
+        in ("true", "1", "yes")
+    )
+    database_busy_timeout: int = field(
+        default_factory=lambda: int(
+            os.getenv("DAILYDOCK_DATABASE_BUSY_TIMEOUT", "5000")
+        )
+    )
+    database_wal_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "DAILYDOCK_DATABASE_WAL_ENABLED", "true"
+        ).lower()
+        in ("true", "1", "yes")
+    )
+
+    def __post_init__(self) -> None:
+        self.data_dir = _resolve_data_dir(self.data_dir)
+
+    def get_resolved_database_url(self) -> str:
+        """Resolve database URL ensuring relative SQLite paths anchor to canonical data_dir."""
+        url = self.database_url
+        sqlite_prefix = "sqlite+aiosqlite:///"
+        if url.startswith(sqlite_prefix):
+            db_path_str = url[len(sqlite_prefix) :]
+            # If in-memory database, return directly
+            if db_path_str == ":memory:":
+                return url
+            db_path = Path(db_path_str)
+            if not db_path.is_absolute():
+                # Anchor relative path to canonical data_dir
+                resolved = (self.data_dir / db_path.name).resolve()
+                return f"{sqlite_prefix}{resolved}"
+        return url
+
     def validate(self) -> None:
         """Validate core configuration parameters.
 
@@ -174,12 +235,28 @@ class Settings:
                 context={"event_max_concurrency": self.event_max_concurrency},
             )
 
+        if not self.database_url:
+            raise ConfigurationError(
+                "database_url cannot be empty.",
+                module="config",
+                context={"database_url": self.database_url},
+            )
+
+        if self.database_busy_timeout < 0:
+            raise ConfigurationError(
+                f"Invalid database_busy_timeout {self.database_busy_timeout}. Must be >= 0.",
+                module="config",
+                context={"database_busy_timeout": self.database_busy_timeout},
+            )
+
     def get_sanitized_dict(self) -> Dict[str, Any]:
         """Return a dictionary of settings with sensitive fields masked."""
         result = {}
         for k, v in self.__dict__.items():
             if any(sensitive in k.lower() for sensitive in SENSITIVE_FIELD_NAMES):
                 result[k] = "********"
+            elif isinstance(v, Path):
+                result[k] = str(v)
             else:
                 result[k] = v
         return result

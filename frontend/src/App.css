@@ -1,0 +1,248 @@
+.container {
+  max-width: 600px;
+  width: 90vw;
+  margin: 2rem auto;
+  padding: 2.5rem;
+  background-color: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  border: 1px solid #e2e8f0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .container {
+    background-color: #1e293b;
+    border-color: #334155;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+  }
+}
+
+.header {
+  margin-bottom: 2rem;
+  text-align: center;
+}
+
+.title {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  color: #0f172a;
+}
+
+@media (prefers-color-scheme: dark) {
+  .title {
+    color: #f8fafc;
+  }
+}
+
+.subtitle {
+  margin-top: 0.5rem;
+  font-size: 0.95rem;
+  color: #64748b;
+}
+
+@media (prefers-color-scheme: dark) {
+  .subtitle {
+    color: #94a3b8;
+  }
+}
+
+.status-card {
+  padding: 1.5rem;
+  border-radius: 8px;
+  border: 1px solid;
+  margin-bottom: 1.5rem;
+  transition: all 0.2s ease-in-out;
+}
+
+.status-card.connected {
+  background-color: #f0fdf4;
+  border-color: #86efac;
+}
+
+.status-card.disconnected {
+  background-color: #fef2f2;
+  border-color: #fca5a5;
+}
+
+.status-card.loading {
+  background-color: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+@media (prefers-color-scheme: dark) {
+  .status-card.connected {
+    background-color: #064e3b20;
+    border-color: #059669;
+  }
+
+  .status-card.disconnected {
+    background-color: #7f1d1d20;
+    border-color: #dc2626;
+  }
+
+  .status-card.loading {
+    background-color: #1e293b;
+    border-color: #475569;
+  }
+}
+
+.status-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.status-label {
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #475569;
+}
+
+@media (prefers-color-scheme: dark) {
+  .status-label {
+    color: #94a3b8;
+  }
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.75rem;
+  border-radius: 9999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.badge-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.badge.connected {
+  background-color: #dcfce7;
+  color: #15803d;
+}
+.badge.connected .badge-dot {
+  background-color: #22c55e;
+}
+
+.badge.disconnected {
+  background-color: #fee2e2;
+  color: #b91c1c;
+}
+.badge.disconnected .badge-dot {
+  background-color: #ef4444;
+}
+
+.badge.loading {
+  background-color: #e2e8f0;
+  color: #475569;
+}
+.badge.loading .badge-dot {
+  background-color: #94a3b8;
+}
+
+.status-details {
+  margin-top: 1rem;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  padding-top: 0.75rem;
+  font-size: 0.875rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .status-details {
+    border-top-color: rgba(255, 255, 255, 0.1);
+  }
+}
+
+.detail-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.35rem 0;
+}
+
+.detail-label {
+  color: #64748b;
+}
+
+@media (prefers-color-scheme: dark) {
+  .detail-label {
+    color: #94a3b8;
+  }
+}
+
+.detail-value {
+  font-family: monospace;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+@media (prefers-color-scheme: dark) {
+  .detail-value {
+    color: #f1f5f9;
+  }
+}
+
+.error-message {
+  margin-top: 0.5rem;
+  font-size: 0.875rem;
+  color: #b91c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  .error-message {
+    color: #f87171;
+  }
+}
+
+.actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 1.5rem;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.6rem 1.25rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-radius: 6px;
+  border: 1px solid #cbd5e1;
+  background-color: #ffffff;
+  color: #334155;
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+}
+
+@media (prefers-color-scheme: dark) {
+  .button {
+    background-color: #334155;
+    border-color: #475569;
+    color: #f1f5f9;
+  }
+}
+
+.button:hover:not(:disabled) {
+  background-color: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+@media (prefers-color-scheme: dark) {
+  .button:hover:not(:disabled) {
+    background-color: #475569;
+  }
+}
+
+.button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+

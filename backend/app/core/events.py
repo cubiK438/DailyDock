@@ -1,4 +1,4 @@
-"""Internal event bus with bounded concurrency, isolated handlers, retry tracking, and graceful shutdown."""
+"""Internal event bus with bounded concurrency, isolated handlers, retry tracking, persistence, and graceful shutdown."""
 
 import asyncio
 from datetime import datetime, timezone
@@ -6,9 +6,14 @@ from enum import Enum
 import inspect
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from uuid import uuid4
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.errors import EventHandlingError
 from app.core.logging import get_logger
+from app.database.models.event import EventModel
+from app.database.models.event_execution import EventHandlerExecutionModel
+from app.database.repositories.event_execution_repository import EventExecutionRepository
+from app.database.session import get_session
 
 logger = get_logger("events")
 
@@ -20,6 +25,7 @@ class ExecutionStatus(str, Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     RETRY_ELIGIBLE = "RETRY_ELIGIBLE"
+    INTERRUPTED = "INTERRUPTED"
 
 
 class Event:
@@ -124,10 +130,15 @@ class HandlerExecutionRecord:
 
 
 class EventBus:
-    """Internal event bus providing concurrent, isolated handler execution and retry management."""
+    """Internal event bus providing concurrent, isolated handler execution, persistence, and retry management."""
 
-    def __init__(self, max_concurrency: int = 10) -> None:
+    def __init__(
+        self,
+        max_concurrency: int = 10,
+        session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    ) -> None:
         self.max_concurrency = max_concurrency
+        self.session_factory = session_factory
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._subscribers: Dict[str, List[HandlerRegistration]] = {}
         self._records: Dict[str, HandlerExecutionRecord] = {}
@@ -171,68 +182,58 @@ class EventBus:
             event_type,
         )
 
-    def publish(self, event: Event) -> str:
-        """Publish an event asynchronously without blocking the caller (fire-and-forget).
+    async def _persist_event_and_records(
+        self, event: Event, records: List[HandlerExecutionRecord]
+    ) -> None:
+        """Atomically persist event and all initial handler execution records in a single transaction."""
+        if self.session_factory is None:
+            return
 
-        Args:
-            event: Event instance to dispatch.
-
-        Returns:
-            The event_id string immediately.
-
-        Raises:
-            EventHandlingError: If the EventBus is shutting down.
-        """
-        if not self._accepting:
+        try:
+            async with get_session(self.session_factory) as session:
+                exec_repo = EventExecutionRepository(session)
+                event_model = EventModel(
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    payload=event.payload,
+                    source_module=event.source_module,
+                    timestamp=event.timestamp,
+                )
+                execution_models = [
+                    EventHandlerExecutionModel(
+                        execution_id=rec.execution_id,
+                        event_id=event.event_id,
+                        handler_id=rec.handler_id,
+                        module=rec.module,
+                        status=ExecutionStatus.PENDING.value,
+                        attempt_count=0,
+                        retry_condition=rec.retry_condition,
+                        created_at=rec.created_at,
+                        updated_at=rec.created_at,
+                    )
+                    for rec in records
+                ]
+                await exec_repo.create_event_with_executions(event_model, execution_models)
+        except Exception as exc:
+            logger.error(
+                "Failed to atomically persist event '%s' (id=%s) and executions: %s",
+                event.event_type,
+                event.event_id,
+                exc,
+                exc_info=True,
+            )
             raise EventHandlingError(
-                "EventBus is shutting down; cannot accept new events.",
+                f"Failed to persist event '{event.event_type}': {exc}",
                 module="events",
                 context={"event_type": event.event_type, "event_id": event.event_id},
-            )
+            ) from exc
 
-        dispatch_task = asyncio.create_task(
-            self._dispatch_event(event),
-            name=f"dailydock-event-{event.event_type}-{event.event_id[:8]}",
-        )
-        self._active_dispatches.add(dispatch_task)
-        dispatch_task.add_done_callback(self._active_dispatches.discard)
-
-        logger.debug("Published event '%s' (id=%s) non-blocking", event.event_type, event.event_id)
-        return event.event_id
-
-    async def publish_and_wait(self, event: Event) -> List[HandlerExecutionRecord]:
-        """Publish an event and await completion of all matching handlers.
-
-        Useful for synchronous workflows and test verification.
-
-        Args:
-            event: Event instance to dispatch.
-
-        Returns:
-            List of HandlerExecutionRecord instances for all registered handlers of this event.
-
-        Raises:
-            EventHandlingError: If the EventBus is shutting down.
-        """
-        if not self._accepting:
-            raise EventHandlingError(
-                "EventBus is shutting down; cannot accept new events.",
-                module="events",
-                context={"event_type": event.event_type, "event_id": event.event_id},
-            )
-
-        return await self._dispatch_event(event)
-
-    async def _dispatch_event(self, event: Event) -> List[HandlerExecutionRecord]:
-        """Dispatch event to all subscribed handlers concurrently with bounded concurrency."""
+    def _prepare_event_records(
+        self, event: Event
+    ) -> tuple[List[HandlerRegistration], List[HandlerExecutionRecord]]:
+        """Resolve subscribers and create in-memory execution records."""
         handlers = list(self._subscribers.get(event.event_type, []))
-        if not handlers:
-            logger.debug("No subscribers for event type '%s'", event.event_type)
-            return []
-
         records: List[HandlerExecutionRecord] = []
-        tasks = []
-
         for reg in handlers:
             record_id = uuid4().hex
             record = HandlerExecutionRecord(
@@ -244,44 +245,227 @@ class EventBus:
             )
             self._records[record_id] = record
             records.append(record)
+        return handlers, records
 
-            tasks.append(self._execute_single_handler(reg, record))
+    async def publish(self, event: Event) -> str:
+        """Publish an event asynchronously after awaiting database persistence.
 
-        # Handlers execute independently; return_exceptions=True isolates failures
-        await asyncio.gather(*tasks, return_exceptions=True)
+        Awaits atomic persistence of the event and handler execution records before
+        scheduling execution in the background.
+
+        Args:
+            event: Event instance to dispatch.
+
+        Returns:
+            The event_id string immediately after persistence.
+
+        Raises:
+            EventHandlingError: If shutting down or if database persistence fails.
+        """
+        if not self._accepting:
+            raise EventHandlingError(
+                "EventBus is shutting down; cannot accept new events.",
+                module="events",
+                context={"event_type": event.event_type, "event_id": event.event_id},
+            )
+
+        handlers, records = self._prepare_event_records(event)
+
+        # 1. Await atomic persistence before scheduling dispatch
+        await self._persist_event_and_records(event, records)
+
+        # 2. Only after successful persistence: schedule background dispatch
+        if handlers:
+            dispatch_task = asyncio.create_task(
+                self._dispatch_handlers(handlers, records),
+                name=f"dailydock-event-{event.event_type}-{event.event_id[:8]}",
+            )
+            self._active_dispatches.add(dispatch_task)
+            dispatch_task.add_done_callback(self._active_dispatches.discard)
+
+        logger.debug("Published event '%s' (id=%s) non-blocking", event.event_type, event.event_id)
+        return event.event_id
+
+    async def publish_and_wait(self, event: Event) -> List[HandlerExecutionRecord]:
+        """Publish an event, await persistence, and await completion of all matching handlers.
+
+        Useful for synchronous workflows and test verification.
+
+        Args:
+            event: Event instance to dispatch.
+
+        Returns:
+            List of HandlerExecutionRecord instances for all registered handlers of this event.
+
+        Raises:
+            EventHandlingError: If shutting down or if database persistence fails.
+        """
+        if not self._accepting:
+            raise EventHandlingError(
+                "EventBus is shutting down; cannot accept new events.",
+                module="events",
+                context={"event_type": event.event_type, "event_id": event.event_id},
+            )
+
+        handlers, records = self._prepare_event_records(event)
+
+        # Await atomic persistence
+        await self._persist_event_and_records(event, records)
+
+        # Await execution
+        if handlers:
+            await self._dispatch_handlers(handlers, records)
+
         return records
+
+    async def _dispatch_handlers(
+        self,
+        handlers: List[HandlerRegistration],
+        records: List[HandlerExecutionRecord],
+    ) -> None:
+        """Execute handlers concurrently with bounded concurrency."""
+        tasks = [
+            self._execute_single_handler(reg, rec)
+            for reg, rec in zip(handlers, records)
+        ]
+        # Handlers execute independently; return_exceptions=True isolates failures
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for record, result in zip(records, results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Handler execution [%s] failed while persisting its outcome: %s",
+                    record.execution_id,
+                    result,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+
+    async def _update_db_execution(
+        self,
+        execution_id: str,
+        status: ExecutionStatus,
+        error: Optional[str] = None,
+        increment_attempt: bool = False,
+        clear_error: bool = False,
+    ) -> None:
+        """Helper to update handler execution record in the database."""
+        if self.session_factory is None:
+            return
+        try:
+            async with get_session(self.session_factory) as session:
+                repo = EventExecutionRepository(session)
+                updated = await repo.update_status(
+                    execution_id=execution_id,
+                    status=status.value,
+                    error=error,
+                    increment_attempt=increment_attempt,
+                    clear_error=clear_error,
+                )
+                if updated is None:
+                    raise EventHandlingError(
+                        f"Execution record '{execution_id}' was not found in the database.",
+                        module="events",
+                        context={"execution_id": execution_id},
+                    )
+        except Exception as exc:
+            logger.error(
+                "Failed to persist database status for execution [%s]: %s",
+                execution_id,
+                exc,
+                exc_info=True,
+            )
+            raise EventHandlingError(
+                f"Failed to persist status for execution '{execution_id}': {exc}",
+                module="events",
+                context={"execution_id": execution_id, "status": status.value},
+            ) from exc
 
     async def _execute_single_handler(
         self, reg: HandlerRegistration, record: HandlerExecutionRecord
     ) -> None:
         """Execute a single handler callback bounded by the concurrency semaphore."""
-        async with self._semaphore:
-            record.status = ExecutionStatus.PENDING
-            record.attempt_count += 1
-            record.last_attempt_at = datetime.now(timezone.utc)
-            try:
-                await reg.callback(record.event)
+        attempt_started = False
+        try:
+            async with self._semaphore:
+                record.status = ExecutionStatus.PENDING
+                record.attempt_count += 1
+                record.last_attempt_at = datetime.now(timezone.utc)
+                attempt_started = True
+                try:
+                    await reg.callback(record.event)
+                except Exception as exc:
+                    record.status = ExecutionStatus.FAILED
+                    record.error = str(exc)
+                    await self._update_db_execution(
+                        record.execution_id,
+                        status=ExecutionStatus.FAILED,
+                        error=str(exc),
+                        increment_attempt=True,
+                    )
+                    logger.warning(
+                        "Handler [%s:%s] failed for event '%s': %s",
+                        record.module,
+                        record.handler_id,
+                        record.event.event_type,
+                        exc,
+                    )
+                    return
+
                 record.status = ExecutionStatus.SUCCESS
                 record.error = None
+                await self._update_db_execution(
+                    record.execution_id,
+                    status=ExecutionStatus.SUCCESS,
+                    error=None,
+                    increment_attempt=True,
+                    clear_error=True,
+                )
                 logger.debug(
                     "Handler [%s:%s] succeeded for event '%s'",
                     record.module,
                     record.handler_id,
                     record.event.event_type,
                 )
-            except Exception as exc:
-                record.status = ExecutionStatus.FAILED
-                record.error = str(exc)
-                logger.warning(
-                    "Handler [%s:%s] failed for event '%s': %s",
-                    record.module,
-                    record.handler_id,
-                    record.event.event_type,
-                    exc,
+        except asyncio.CancelledError:
+            record.status = ExecutionStatus.INTERRUPTED
+            record.error = "Handler execution was interrupted during shutdown."
+            try:
+                await self._update_db_execution(
+                    record.execution_id,
+                    status=ExecutionStatus.INTERRUPTED,
+                    error=record.error,
+                    increment_attempt=attempt_started,
                 )
+            except Exception:
+                logger.error(
+                    "Could not persist interrupted status for execution [%s].",
+                    record.execution_id,
+                    exc_info=True,
+                )
+            raise
+
+    async def _retry_after_persisting_eligibility(
+        self, record_id: str, previous_status: ExecutionStatus
+    ) -> None:
+        """Persist automatic retry eligibility before executing the retry."""
+        try:
+            await self._update_db_execution(
+                record_id, status=ExecutionStatus.RETRY_ELIGIBLE
+            )
+        except Exception:
+            record = self._records.get(record_id)
+            if record is not None:
+                record.status = previous_status
+            logger.error(
+                "Automatic retry for execution [%s] was not started because eligibility could not be persisted.",
+                record_id,
+                exc_info=True,
+            )
+            return
+
+        await self._safe_retry_handler(record_id)
 
     def notify_condition(self, condition: str) -> List[str]:
-        """Notify the event bus of a condition change.
+        """Notify the event bus of a condition change to trigger retries for matching failed handlers.
 
         Marks matching failed handlers as RETRY_ELIGIBLE and automatically
         triggers their retry execution in the background.
@@ -308,6 +492,7 @@ class EventBus:
                 record.status in (ExecutionStatus.FAILED, ExecutionStatus.RETRY_ELIGIBLE)
                 and record.retry_condition == condition
             ):
+                previous_status = record.status
                 record.status = ExecutionStatus.RETRY_ELIGIBLE
                 eligible_ids.append(record_id)
                 logger.info(
@@ -318,9 +503,9 @@ class EventBus:
                     condition,
                 )
 
-                # Automatically trigger retry execution in the background
+                # Persist eligibility before invoking the retry in the background.
                 retry_task = asyncio.create_task(
-                    self._safe_retry_handler(record_id),
+                    self._retry_after_persisting_eligibility(record_id, previous_status),
                     name=f"dailydock-retry-{record.handler_id}-{record_id[:8]}",
                 )
                 self._active_dispatches.add(retry_task)
@@ -372,7 +557,16 @@ class EventBus:
             return []
 
         for record_id in eligible_ids:
-            self._records[record_id].status = ExecutionStatus.RETRY_ELIGIBLE
+            record = self._records[record_id]
+            previous_status = record.status
+            record.status = ExecutionStatus.RETRY_ELIGIBLE
+            try:
+                await self._update_db_execution(
+                    record_id, status=ExecutionStatus.RETRY_ELIGIBLE
+                )
+            except Exception:
+                record.status = previous_status
+                raise
 
         records = await asyncio.gather(
             *[self._safe_retry_handler(record_id) for record_id in eligible_ids],
@@ -516,4 +710,3 @@ class EventBus:
 
         self._active_dispatches.clear()
         logger.info("EventBus shutdown complete.")
-

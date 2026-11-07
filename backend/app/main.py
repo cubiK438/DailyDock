@@ -1,6 +1,6 @@
 """Main application entry point for DailyDock backend."""
 
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,13 +15,15 @@ from app.core.events import EventBus
 from app.core.logging import get_logger, setup_logging
 from app.core.registry import ModuleRegistry
 from app.core.tasks import TaskManager
+from app.database.manager import DatabaseManager
+from app.database.recovery import run_startup_recovery
 
 logger = get_logger("app")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application startup, core component initialization, and graceful shutdown."""
+    """Manage application startup, core component initialization, persistence, and graceful shutdown."""
     # 1. Validate configuration
     settings.validate()
 
@@ -29,42 +31,52 @@ async def lifespan(app: FastAPI):
     setup_logging(settings.log_level)
     logger.info("Starting DailyDock backend in %s mode...", settings.env)
 
-    # 3. Instantiate core infrastructure
-    task_manager = TaskManager(
-        max_concurrency=settings.task_max_concurrency,
-        max_pending=settings.task_max_pending,
-    )
-    event_bus = EventBus(max_concurrency=settings.event_max_concurrency)
-    module_registry = ModuleRegistry()
+    async with AsyncExitStack() as stack:
+        # Register cleanup immediately after constructing each resource so partial
+        # startup failures unwind everything that was successfully initialized.
+        db_manager = DatabaseManager()
+        stack.push_async_callback(db_manager.close)
+        await db_manager.initialize()
 
-    # Attach to app state for access across endpoints and handlers
-    app.state.settings = settings
-    app.state.task_manager = task_manager
-    app.state.event_bus = event_bus
-    app.state.module_registry = module_registry
+        # Execute startup recovery check for interrupted operations.
+        await run_startup_recovery(db_manager.session_factory)
 
-    # 4. Initialize application modules in dependency order
-    await module_registry.startup()
+        task_manager = TaskManager(
+            max_concurrency=settings.task_max_concurrency,
+            max_pending=settings.task_max_pending,
+            session_factory=db_manager.session_factory,
+        )
+        stack.push_async_callback(
+            task_manager.shutdown,
+            grace_period=settings.shutdown_grace_period_seconds,
+        )
+        event_bus = EventBus(
+            max_concurrency=settings.event_max_concurrency,
+            session_factory=db_manager.session_factory,
+        )
+        stack.push_async_callback(
+            event_bus.shutdown,
+            grace_period=settings.shutdown_grace_period_seconds,
+        )
+        module_registry = ModuleRegistry()
+        stack.push_async_callback(module_registry.shutdown)
 
-    logger.info("DailyDock core initialization complete.")
+        # Attach to app state for access across endpoints and handlers.
+        app.state.settings = settings
+        app.state.db_manager = db_manager
+        app.state.session_factory = db_manager.session_factory
+        app.state.task_manager = task_manager
+        app.state.event_bus = event_bus
+        app.state.module_registry = module_registry
 
-    try:
-        yield
-    finally:
-        logger.info("DailyDock backend shutting down...")
+        # Initialize application modules in dependency order.
+        await module_registry.startup()
 
-        # Application shutdown sequence:
-        # 1 & 2. Stop accepting work and drain active background tasks and events
-        grace_period = settings.shutdown_grace_period_seconds
-        logger.info("Draining background tasks and events (grace period: %.1fs)...", grace_period)
-
-        await task_manager.shutdown(grace_period=grace_period)
-        await event_bus.shutdown(grace_period=grace_period)
-
-        # 3. Shut down modules in reverse dependency order
-        await module_registry.shutdown()
-
-        logger.info("DailyDock shutdown complete.")
+        logger.info("DailyDock core initialization complete.")
+        try:
+            yield
+        finally:
+            logger.info("DailyDock backend shutting down...")
 
 
 def create_app() -> FastAPI:

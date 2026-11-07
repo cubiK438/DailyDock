@@ -15,7 +15,7 @@ async def test_task_submission_and_successful_completion():
         await asyncio.sleep(0.01)
         return x + y
 
-    task_id = manager.submit("add_numbers", sample_work, 3, 4, module="math")
+    task_id = await manager.submit("add_numbers", sample_work, 3, 4, module="math")
     record = manager.get_task(task_id)
     assert record is not None
     assert record.name == "add_numbers"
@@ -41,7 +41,7 @@ async def test_task_failure_does_not_crash_application():
         await asyncio.sleep(0.01)
         raise ValueError("Simulated computation error")
 
-    task_id = manager.submit("broken_task", broken_work, module="test")
+    task_id = await manager.submit("broken_task", broken_work, module="test")
     record = manager.get_task(task_id)
 
     while record.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
@@ -60,7 +60,7 @@ async def test_task_cancellation():
     async def long_running_task():
         await asyncio.sleep(1.0)
 
-    task_id = manager.submit("long_task", long_running_task)
+    task_id = await manager.submit("long_task", long_running_task)
     await asyncio.sleep(0.02)  # Give time to start
 
     cancelled = manager.cancel(task_id)
@@ -86,7 +86,7 @@ async def test_concurrency_limit_enforced():
         current_concurrent -= 1
 
     # Submit 4 tasks
-    task_ids = [manager.submit(f"task_{i}", track_concurrency) for i in range(4)]
+    task_ids = [await manager.submit(f"task_{i}", track_concurrency) for i in range(4)]
 
     # Await all tasks
     for tid in task_ids:
@@ -109,17 +109,17 @@ async def test_pending_queue_limit_and_rejection():
         await release_event.wait()
 
     # Task 1 starts running (acquires concurrency slot)
-    manager.submit("running_task", blocking_task)
+    await manager.submit("running_task", blocking_task)
     await asyncio.sleep(0.01)
 
     # Tasks 2 & 3 fill the pending capacity (pending=2)
-    manager.submit("pending_1", blocking_task)
-    manager.submit("pending_2", blocking_task)
+    await manager.submit("pending_1", blocking_task)
+    await manager.submit("pending_2", blocking_task)
     assert manager.pending_count == 2
 
     # Task 4 should exceed max_pending=2 and raise TaskQueueFullError
     with pytest.raises(TaskQueueFullError) as exc_info:
-        manager.submit("pending_3", blocking_task)
+        await manager.submit("pending_3", blocking_task)
 
     assert "capacity exceeded" in str(exc_info.value)
 
@@ -136,7 +136,7 @@ async def test_task_manager_shutdown_cancels_active_and_rejects_new():
     async def perpetual_task():
         await asyncio.sleep(10.0)
 
-    task_id = manager.submit("perpetual", perpetual_task)
+    task_id = await manager.submit("perpetual", perpetual_task)
     await asyncio.sleep(0.02)
 
     # Shut down with small grace period
@@ -147,5 +147,4 @@ async def test_task_manager_shutdown_cancels_active_and_rejects_new():
 
     # Subsequent submissions must be rejected
     with pytest.raises(TaskExecutionError):
-        manager.submit("new_task", perpetual_task)
-
+        await manager.submit("new_task", perpetual_task)

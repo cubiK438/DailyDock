@@ -52,7 +52,7 @@ async def test_non_blocking_publish():
     bus.subscribe("slow.event", slow_handler, handler_id="slow_h", module="test")
     event = Event("slow.event", payload={})
 
-    event_id = bus.publish(event)
+    event_id = await bus.publish(event)
     assert event_id == event.event_id
     assert completed is False  # Not finished yet upon return
 
@@ -258,11 +258,11 @@ async def test_event_bus_shutdown_drains_and_rejects_new():
     bus.subscribe("drain.event", handler, handler_id="drain_h", module="test")
     event = Event("drain.event")
 
-    bus.publish(event)
+    await bus.publish(event)
     await bus.shutdown(grace_period=0.1)
 
     assert handler_completed is True
 
     # Subsequent publish should be rejected
     with pytest.raises(EventHandlingError):
-        bus.publish(Event("after.shutdown"))
+        await bus.publish(Event("after.shutdown"))

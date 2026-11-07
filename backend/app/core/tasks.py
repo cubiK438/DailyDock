@@ -1,13 +1,16 @@
-"""Background task manager with bounded concurrency, queue limits, and graceful shutdown."""
+"""Background task manager with bounded concurrency, queue limits, persistence, and graceful shutdown."""
 
 import asyncio
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 from uuid import uuid4
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.errors import TaskExecutionError, TaskQueueFullError
 from app.core.logging import get_logger
+from app.database.repositories.task_repository import TaskRepository
+from app.database.session import get_session
 
 logger = get_logger("tasks")
 
@@ -20,6 +23,7 @@ class TaskStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    INTERRUPTED = "INTERRUPTED"
 
 
 class TaskRecord:
@@ -56,9 +60,15 @@ class TaskRecord:
 class TaskManager:
     """Coordinates execution, concurrency bounds, pending capacity, and lifecycle of background tasks."""
 
-    def __init__(self, max_concurrency: int = 5, max_pending: int = 20) -> None:
+    def __init__(
+        self,
+        max_concurrency: int = 5,
+        max_pending: int = 20,
+        session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    ) -> None:
         self.max_concurrency = max_concurrency
         self.max_pending = max_pending
+        self.session_factory = session_factory
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._accepting = True
         self._pending_count = 0
@@ -75,7 +85,7 @@ class TaskManager:
         """Return the current number of actively executing tasks."""
         return sum(1 for t in self._tasks.values() if t.status == TaskStatus.RUNNING)
 
-    def submit(
+    async def submit(
         self,
         name: str,
         coroutine_fn: Callable[..., Coroutine[Any, Any, Any]],
@@ -83,7 +93,7 @@ class TaskManager:
         module: str = "app",
         **kwargs: Any,
     ) -> str:
-        """Submit a coroutine for background execution.
+        """Submit a coroutine for background execution after persisting its initial record.
 
         Args:
             name: Human-readable task name.
@@ -96,7 +106,7 @@ class TaskManager:
             The unique task_id string.
 
         Raises:
-            TaskExecutionError: If the TaskManager is shutting down.
+            TaskExecutionError: If shutting down or if database persistence fails.
             TaskQueueFullError: If the pending queue capacity has been reached.
         """
         if not self._accepting:
@@ -119,6 +129,34 @@ class TaskManager:
 
         task_id = uuid4().hex
         record = TaskRecord(task_id=task_id, name=name, module=module)
+
+        # 1. Await database persistence before scheduling work
+        if self.session_factory is not None:
+            try:
+                async with get_session(self.session_factory) as session:
+                    repo = TaskRepository(session)
+                    await repo.create_task(
+                        task_id=task_id,
+                        name=name,
+                        module=module,
+                        status=TaskStatus.PENDING.value,
+                        created_at=record.created_at,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Failed to persist task [%s:%s] to database: %s",
+                    module,
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+                raise TaskExecutionError(
+                    f"Failed to persist task '{name}': {exc}",
+                    module="tasks",
+                    context={"task_name": name, "module": module},
+                ) from exc
+
+        # 2. Only after successful persistence: register in memory and schedule
         self._tasks[task_id] = record
         self._pending_count += 1
 
@@ -137,6 +175,32 @@ class TaskManager:
         )
         return task_id
 
+    async def _update_db_status(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        started_at: Optional[datetime] = None,
+        completed_at: Optional[datetime] = None,
+        error: Optional[str] = None,
+        result: Optional[Any] = None,
+    ) -> None:
+        """Helper to asynchronously update task record in the database."""
+        if self.session_factory is None:
+            return
+        try:
+            async with get_session(self.session_factory) as session:
+                repo = TaskRepository(session)
+                await repo.update_status(
+                    task_id=task_id,
+                    status=status.value,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    error=error,
+                    result=result,
+                )
+        except Exception as exc:
+            logger.error("Failed to update database status for task [%s]: %s", task_id, exc)
+
     async def _execute_task(
         self,
         task_id: str,
@@ -151,6 +215,11 @@ class TaskManager:
                 self._pending_count = max(0, self._pending_count - 1)
                 record.status = TaskStatus.RUNNING
                 record.started_at = datetime.now(timezone.utc)
+                await self._update_db_status(
+                    task_id,
+                    status=TaskStatus.RUNNING,
+                    started_at=record.started_at,
+                )
                 logger.debug("Task [%s:%s] started execution.", record.module, record.name)
 
                 # Execute coroutine
@@ -178,6 +247,13 @@ class TaskManager:
 
         finally:
             record.completed_at = datetime.now(timezone.utc)
+            await self._update_db_status(
+                task_id,
+                status=record.status,
+                completed_at=record.completed_at,
+                error=record.error,
+                result=record.result,
+            )
             self._asyncio_tasks.pop(task_id, None)
 
     def cancel(self, task_id: str) -> bool:
@@ -190,7 +266,12 @@ class TaskManager:
         if not record:
             return False
 
-        if record.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        if record.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.INTERRUPTED,
+        ):
             return False
 
         async_task = self._asyncio_tasks.get(task_id)
@@ -203,6 +284,15 @@ class TaskManager:
         record.error = "Cancelled before execution."
         record.completed_at = datetime.now(timezone.utc)
         self._pending_count = max(0, self._pending_count - 1)
+        if self.session_factory is not None:
+            asyncio.create_task(
+                self._update_db_status(
+                    task_id,
+                    status=TaskStatus.CANCELLED,
+                    completed_at=record.completed_at,
+                    error=record.error,
+                )
+            )
         return True
 
     def get_task(self, task_id: str) -> Optional[TaskRecord]:
@@ -261,8 +351,13 @@ class TaskManager:
                 record.status = TaskStatus.CANCELLED
                 record.error = "Cancelled during application shutdown."
                 record.completed_at = datetime.now(timezone.utc)
+                await self._update_db_status(
+                    task_id,
+                    status=TaskStatus.CANCELLED,
+                    completed_at=record.completed_at,
+                    error=record.error,
+                )
 
         self._asyncio_tasks.clear()
         self._pending_count = 0
         logger.info("TaskManager shutdown complete.")
-
