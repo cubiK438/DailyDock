@@ -1,15 +1,18 @@
 """Centralized application configuration settings for DailyDock."""
 
 import os
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from app.core.errors import ConfigurationError
 
 VALID_ENVIRONMENTS = {"development", "production", "test"}
 VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 SENSITIVE_FIELD_NAMES = {"password", "token", "secret", "key", "api_key", "credential"}
+MAX_MONITOR_CONCURRENCY = 10
 
 # Canonical root directory of the DailyDock repository
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -22,6 +25,25 @@ def _resolve_data_dir(data_dir: Path) -> Path:
     if not data_dir.is_absolute():
         data_dir = PROJECT_ROOT / data_dir
     return data_dir.resolve()
+
+
+def _load_json_list(env_name: str) -> List[Dict[str, Any]]:
+    raw = os.getenv(env_name, "[]")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(
+            f"{env_name} must contain a valid JSON array.",
+            module="config",
+            context={"setting": env_name},
+        ) from exc
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ConfigurationError(
+            f"{env_name} must contain a JSON array of objects.",
+            module="config",
+            context={"setting": env_name},
+        )
+    return value
 
 
 def _load_env_file(dotenv_path: Optional[Path] = None) -> None:
@@ -161,6 +183,75 @@ class Settings:
         in ("true", "1", "yes")
     )
 
+    # Infrastructure monitoring configuration
+    monitor_enabled: bool = field(
+        default_factory=lambda: os.getenv("DAILYDOCK_MONITOR_ENABLED", "true").lower()
+        in ("true", "1", "yes")
+    )
+    monitor_max_concurrency: int = field(
+        default_factory=lambda: int(os.getenv("DAILYDOCK_MONITOR_MAX_CONCURRENCY", "2"))
+    )
+    monitor_system_interval: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_SYSTEM_INTERVAL", "30"))
+    )
+    monitor_storage_interval: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_STORAGE_INTERVAL", "60"))
+    )
+    monitor_connectivity_interval: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_CONNECTIVITY_INTERVAL", "30"))
+    )
+    monitor_http_interval: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_HTTP_INTERVAL", "60"))
+    )
+    monitor_service_interval: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_SERVICE_INTERVAL", "30"))
+    )
+    monitor_check_timeout: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_CHECK_TIMEOUT", "5"))
+    )
+    monitor_stale_multiplier: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_STALE_MULTIPLIER", "2"))
+    )
+    monitor_failure_threshold: int = field(
+        default_factory=lambda: int(os.getenv("DAILYDOCK_MONITOR_FAILURE_THRESHOLD", "2"))
+    )
+    monitor_recovery_threshold: int = field(
+        default_factory=lambda: int(os.getenv("DAILYDOCK_MONITOR_RECOVERY_THRESHOLD", "1"))
+    )
+    monitor_cpu_warning_percent: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_CPU_WARNING_PERCENT", "80"))
+    )
+    monitor_cpu_critical_percent: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_CPU_CRITICAL_PERCENT", "95"))
+    )
+    monitor_ram_warning_percent: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_RAM_WARNING_PERCENT", "80"))
+    )
+    monitor_ram_critical_percent: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_RAM_CRITICAL_PERCENT", "90"))
+    )
+    monitor_storage_warning_percent: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_STORAGE_WARNING_PERCENT", "80"))
+    )
+    monitor_storage_critical_percent: float = field(
+        default_factory=lambda: float(os.getenv("DAILYDOCK_MONITOR_STORAGE_CRITICAL_PERCENT", "90"))
+    )
+    monitor_retention_days: int = field(
+        default_factory=lambda: int(os.getenv("DAILYDOCK_MONITOR_RETENTION_DAYS", "30"))
+    )
+    monitor_retention_batch_size: int = field(
+        default_factory=lambda: int(os.getenv("DAILYDOCK_MONITOR_RETENTION_BATCH_SIZE", "500"))
+    )
+    monitor_http_endpoints: List[Dict[str, Any]] = field(
+        default_factory=lambda: _load_json_list("DAILYDOCK_MONITOR_HTTP_ENDPOINTS")
+    )
+    monitor_connectivity_probes: List[Dict[str, Any]] = field(
+        default_factory=lambda: _load_json_list("DAILYDOCK_MONITOR_CONNECTIVITY_PROBES")
+    )
+    monitor_storage_targets: List[Dict[str, Any]] = field(
+        default_factory=lambda: _load_json_list("DAILYDOCK_MONITOR_STORAGE_TARGETS")
+    )
+
     def __post_init__(self) -> None:
         self.data_dir = _resolve_data_dir(self.data_dir)
 
@@ -248,6 +339,154 @@ class Settings:
                 module="config",
                 context={"database_busy_timeout": self.database_busy_timeout},
             )
+
+        intervals = {
+            "monitor_system_interval": self.monitor_system_interval,
+            "monitor_storage_interval": self.monitor_storage_interval,
+            "monitor_connectivity_interval": self.monitor_connectivity_interval,
+            "monitor_http_interval": self.monitor_http_interval,
+            "monitor_service_interval": self.monitor_service_interval,
+        }
+        if not (1 <= self.monitor_max_concurrency <= MAX_MONITOR_CONCURRENCY):
+            raise ConfigurationError(
+                f"monitor_max_concurrency must be between 1 and {MAX_MONITOR_CONCURRENCY}.",
+                module="config",
+            )
+        for name, value in intervals.items():
+            if not (1 <= value <= 86400):
+                raise ConfigurationError(
+                    f"{name} must be between 1 and 86400 seconds.", module="config"
+                )
+        if not (0 < self.monitor_check_timeout <= 300):
+            raise ConfigurationError(
+                "monitor_check_timeout must be greater than 0 and at most 300 seconds.",
+                module="config",
+            )
+        if self.monitor_stale_multiplier <= 0:
+            raise ConfigurationError(
+                "monitor_stale_multiplier must be greater than 0.", module="config"
+            )
+        for name, value in {
+            "monitor_failure_threshold": self.monitor_failure_threshold,
+            "monitor_recovery_threshold": self.monitor_recovery_threshold,
+            "monitor_retention_days": self.monitor_retention_days,
+            "monitor_retention_batch_size": self.monitor_retention_batch_size,
+        }.items():
+            if value < 1:
+                raise ConfigurationError(f"{name} must be at least 1.", module="config")
+
+        for label, warning, critical in (
+            ("CPU", self.monitor_cpu_warning_percent, self.monitor_cpu_critical_percent),
+            ("RAM", self.monitor_ram_warning_percent, self.monitor_ram_critical_percent),
+            ("storage", self.monitor_storage_warning_percent, self.monitor_storage_critical_percent),
+        ):
+            if not (0 <= warning <= 100 and 0 <= critical <= 100 and warning < critical):
+                raise ConfigurationError(
+                    f"{label} warning and critical thresholds must be within 0..100, with warning below critical.",
+                    module="config",
+                )
+
+        self._validate_monitor_targets(
+            self.monitor_http_endpoints, "monitor_http_endpoints", require_url=True
+        )
+        self._validate_monitor_targets(
+            self.monitor_connectivity_probes,
+            "monitor_connectivity_probes",
+            require_url=True,
+        )
+        self._validate_monitor_targets(
+            self.monitor_storage_targets,
+            "monitor_storage_targets",
+            require_url=False,
+        )
+
+    @staticmethod
+    def _validate_monitor_targets(
+        targets: List[Dict[str, Any]], setting_name: str, require_url: bool
+    ) -> None:
+        if len(targets) > 50:
+            raise ConfigurationError(
+                f"{setting_name} supports at most 50 configured targets.",
+                module="config",
+            )
+        identifiers = set()
+        for target in targets:
+            target_id = target.get("id")
+            if not isinstance(target_id, str) or not target_id.strip():
+                raise ConfigurationError(
+                    f"Every entry in {setting_name} must have a non-empty id.",
+                    module="config",
+                )
+            if target_id in identifiers:
+                raise ConfigurationError(
+                    f"Duplicate target id '{target_id}' in {setting_name}.",
+                    module="config",
+                )
+            identifiers.add(target_id)
+            if "enabled" in target and not isinstance(target["enabled"], bool):
+                raise ConfigurationError(
+                    f"Target '{target_id}' enabled must be a boolean.",
+                    module="config",
+                )
+            for name in ("interval", "timeout"):
+                if name in target:
+                    try:
+                        number = float(target[name])
+                    except (TypeError, ValueError):
+                        number = 0
+                    valid_number = (
+                        1 <= number <= 86400
+                        if name == "interval"
+                        else 0 < number <= 300
+                    )
+                    if not valid_number:
+                        raise ConfigurationError(
+                            f"Target '{target_id}' {name} is outside the supported range.",
+                            module="config",
+                        )
+            if require_url:
+                url = target.get("url")
+                parsed = urlparse(url) if isinstance(url, str) else None
+                if (
+                    parsed is None
+                    or parsed.scheme not in {"http", "https"}
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                ):
+                    raise ConfigurationError(
+                        f"Target '{target_id}' in {setting_name} requires an HTTP(S) URL without embedded credentials.",
+                        module="config",
+                    )
+                minimum = target.get("accepted_status_min", 200)
+                maximum = target.get("accepted_status_max", 399)
+                if (
+                    not isinstance(minimum, int)
+                    or not isinstance(maximum, int)
+                    or not (100 <= minimum <= maximum <= 599)
+                ):
+                    raise ConfigurationError(
+                        f"Target '{target_id}' has an invalid accepted HTTP status range.",
+                        module="config",
+                    )
+            else:
+                mount_path = target.get("mount_path")
+                if not isinstance(mount_path, str) or not mount_path.startswith("/"):
+                    raise ConfigurationError(
+                        f"Storage target '{target_id}' must have an absolute mount_path.",
+                        module="config",
+                    )
+                expected_uuid = target.get("expected_uuid")
+                if expected_uuid is not None and not isinstance(expected_uuid, str):
+                    raise ConfigurationError(
+                        f"Storage target '{target_id}' expected_uuid must be a string.",
+                        module="config",
+                    )
+                if expected_uuid == "":
+                    raise ConfigurationError(
+                        f"Storage target '{target_id}' expected_uuid cannot be empty.",
+                        module="config",
+                    )
 
     def get_sanitized_dict(self) -> Dict[str, Any]:
         """Return a dictionary of settings with sensitive fields masked."""

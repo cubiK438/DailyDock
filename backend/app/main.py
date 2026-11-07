@@ -3,8 +3,10 @@
 from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from app.api.health import router as health_router
+from app.api.monitoring import router as monitoring_router
 from app.config import settings
 from app.core.errors import (
     DailyDockError,
@@ -17,6 +19,7 @@ from app.core.registry import ModuleRegistry
 from app.core.tasks import TaskManager
 from app.database.manager import DatabaseManager
 from app.database.recovery import run_startup_recovery
+from app.monitoring.module import MonitoringModule
 
 logger = get_logger("app")
 
@@ -59,6 +62,17 @@ async def lifespan(app: FastAPI):
             grace_period=settings.shutdown_grace_period_seconds,
         )
         module_registry = ModuleRegistry()
+        monitoring_module = MonitoringModule(settings, db_manager.session_factory)
+
+        async def check_database_health():
+            async with db_manager.session_factory() as session:
+                await session.execute(text("SELECT 1"))
+            return {"healthy": True, "detail": "Database query succeeded"}
+
+        monitoring_module.register_service_check(
+            "database", check_database_health, name="Database"
+        )
+        module_registry.register(monitoring_module)
         stack.push_async_callback(module_registry.shutdown)
 
         # Attach to app state for access across endpoints and handlers.
@@ -68,6 +82,7 @@ async def lifespan(app: FastAPI):
         app.state.task_manager = task_manager
         app.state.event_bus = event_bus
         app.state.module_registry = module_registry
+        app.state.monitoring_module = monitoring_module
 
         # Initialize application modules in dependency order.
         await module_registry.startup()
@@ -102,6 +117,7 @@ def create_app() -> FastAPI:
 
     # Register API routes under /api
     app.include_router(health_router, prefix="/api")
+    app.include_router(monitoring_router, prefix="/api")
 
     return app
 

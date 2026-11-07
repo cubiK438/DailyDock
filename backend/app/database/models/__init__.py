@@ -2,11 +2,22 @@
 
 from app.database.models.event import EventModel
 from app.database.models.event_execution import EventHandlerExecutionModel
+from app.database.models.monitoring import (
+    ConnectivitySample,
+    HttpCheckSample,
+    ServiceCheckSample,
+    StorageSample,
+    SystemMetricSample,
+)
 from app.database.models.task import BackgroundTaskModel
 
 __all__ = [
     "BackgroundTaskModel",
+    "ConnectivitySample",
     "EventModel",
     "EventHandlerExecutionModel",
+    "HttpCheckSample",
+    "ServiceCheckSample",
+    "StorageSample",
+    "SystemMetricSample",
 ]
-

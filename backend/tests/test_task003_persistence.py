@@ -275,6 +275,9 @@ async def test_lifespan_cleans_up_resources_after_startup_failure(
         def __init__(self):
             calls.append("modules.initialize")
 
+        def register(self, module):
+            calls.append(f"modules.register:{module.name}")
+
         async def startup(self):
             calls.append("modules.startup")
             raise RuntimeError("module startup failed")
@@ -303,6 +306,7 @@ async def test_lifespan_cleans_up_resources_after_startup_failure(
         "tasks.initialize",
         "events.initialize",
         "modules.initialize",
+        "modules.register:monitoring",
         "modules.startup",
         "modules.shutdown",
         "events.shutdown",
