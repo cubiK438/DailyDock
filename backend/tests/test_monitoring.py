@@ -8,14 +8,14 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.monitoring import router
 from app.config import Settings
 from app.core.errors import ConfigurationError
 from app.database.base import Base
 from app.database.manager import DatabaseManager
-from app.database.models.monitoring import ConnectivitySample
+from app.database.models.monitoring import ConnectivitySample, SystemMetricSample
 from app.monitoring.collectors import LinuxMountProvider, SystemCollector
 from app.monitoring.module import MonitoringModule
 from app.monitoring.repository import MonitoringRepository
@@ -31,6 +31,90 @@ async def _database(path: Path) -> DatabaseManager:
     async with manager.engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     return manager
+
+
+@pytest.mark.anyio
+async def test_sqlite_pragmas_are_configured_at_initialization_and_per_connection(
+    tmp_path: Path,
+):
+    busy_timeout = 4321
+    manager = DatabaseManager(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'pragmas.db'}",
+        busy_timeout=busy_timeout,
+        wal_enabled=True,
+    )
+    try:
+        await manager.initialize()
+
+        async with manager.engine.connect() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode")
+            assert journal_mode.scalar_one().lower() == "wal"
+
+        connections = await asyncio.gather(
+            *(manager.engine.connect() for _ in range(3))
+        )
+        try:
+            async def read_pragmas(connection):
+                foreign_keys = await connection.exec_driver_sql("PRAGMA foreign_keys")
+                timeout = await connection.exec_driver_sql("PRAGMA busy_timeout")
+                return foreign_keys.scalar_one(), timeout.scalar_one()
+
+            pragmas = await asyncio.gather(
+                *(read_pragmas(connection) for connection in connections)
+            )
+            assert pragmas == [(1, busy_timeout)] * len(connections)
+        finally:
+            await asyncio.gather(*(connection.close() for connection in connections))
+    finally:
+        await manager.close()
+
+
+@pytest.mark.anyio
+async def test_concurrent_monitoring_writes_and_retention_do_not_lock_database(
+    tmp_path: Path,
+):
+    manager = await _database(tmp_path / "concurrent-writes.db")
+    repository = MonitoringRepository(manager.session_factory)
+    sample_count = 40
+    observed_at = datetime.now(timezone.utc)
+
+    def system_sample(index: int):
+        return {
+            "observed_at": observed_at,
+            "cpu_percent": float(index),
+            "memory_total_bytes": 1000,
+            "memory_used_bytes": 500,
+            "memory_available_bytes": 500,
+            "memory_percent": 50.0,
+            "uptime_seconds": float(index),
+            "status": "OK",
+            "check_result": "SUCCESS",
+            "error": None,
+            "consecutive_failures": 0,
+            "consecutive_successes": index + 1,
+            "last_transition_at": observed_at,
+        }
+
+    try:
+        writes = [
+            repository.add_sample("system", system_sample(index))
+            for index in range(sample_count)
+        ]
+        cleanups = [
+            repository.cleanup_batch(
+                observed_at + timedelta(seconds=1), batch_size=2
+            )
+            for _ in range(5)
+        ]
+        await asyncio.gather(*writes, *cleanups)
+
+        async with manager.session_factory() as session:
+            count = await session.scalar(
+                select(func.count(SystemMetricSample.id))
+            )
+        assert 1 <= count <= sample_count
+    finally:
+        await manager.close()
 
 
 class FakeMountProvider:

@@ -1,9 +1,10 @@
 """Persistence and bounded history queries for monitoring samples."""
 
+import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Type
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database.models.monitoring import (
@@ -30,14 +31,16 @@ class MonitoringRepository:
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self.session_factory = session_factory
+        self._write_lock = asyncio.Lock()
 
     async def add_sample(self, domain: str, values: Dict[str, Any]) -> Any:
         model_type = MODEL_BY_DOMAIN[domain]
-        async with get_session(self.session_factory) as session:
-            sample = model_type(**values)
-            session.add(sample)
-            await session.flush()
-            return sample
+        async with self._write_lock:
+            async with get_session(self.session_factory) as session:
+                sample = model_type(**values)
+                session.add(sample)
+                await session.flush()
+                return sample
 
     async def latest(
         self, domain: str, target_id: Optional[str] = None
@@ -110,26 +113,27 @@ class MonitoringRepository:
 
     async def cleanup_batch(self, cutoff: datetime, batch_size: int) -> int:
         """Delete at most one bounded batch from each sample table, preserving latest rows."""
-        deleted = 0
-        for domain, model_type in MODEL_BY_DOMAIN.items():
-            async with get_session(self.session_factory) as session:
-                latest_ids = await self._latest_ids(session, domain, model_type)
-                statement = (
-                    select(model_type.id)
-                    .where(model_type.observed_at < cutoff)
-                    .order_by(model_type.observed_at.asc(), model_type.id.asc())
-                    .limit(batch_size)
-                )
-                if latest_ids:
-                    statement = statement.where(model_type.id.not_in(latest_ids))
-                ids_result = await session.execute(statement)
-                ids = list(ids_result.scalars().all())
-                if ids:
-                    result = await session.execute(
-                        delete(model_type).where(model_type.id.in_(ids))
+        async with self._write_lock:
+            deleted = 0
+            for domain, model_type in MODEL_BY_DOMAIN.items():
+                async with get_session(self.session_factory) as session:
+                    latest_ids = await self._latest_ids(session, domain, model_type)
+                    statement = (
+                        select(model_type.id)
+                        .where(model_type.observed_at < cutoff)
+                        .order_by(model_type.observed_at.asc(), model_type.id.asc())
+                        .limit(batch_size)
                     )
-                    deleted += result.rowcount or 0
-        return deleted
+                    if latest_ids:
+                        statement = statement.where(model_type.id.not_in(latest_ids))
+                    ids_result = await session.execute(statement)
+                    ids = list(ids_result.scalars().all())
+                    if ids:
+                        result = await session.execute(
+                            delete(model_type).where(model_type.id.in_(ids))
+                        )
+                        deleted += result.rowcount or 0
+            return deleted
 
     @staticmethod
     async def _latest_ids(

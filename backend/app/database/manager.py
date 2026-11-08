@@ -79,16 +79,15 @@ class DatabaseManager:
         # Configure SQLite connection PRAGMAs on the underlying sync engine
         if "sqlite" in self.database_url:
             busy_timeout = self.busy_timeout
-            wal_enabled = self.wal_enabled
 
             @event.listens_for(self._engine.sync_engine, "connect")
             def _configure_sqlite(dbapi_connection, connection_record):
                 cursor = dbapi_connection.cursor()
-                cursor.execute("PRAGMA foreign_keys = ON;")
-                cursor.execute(f"PRAGMA busy_timeout = {busy_timeout};")
-                if wal_enabled:
-                    cursor.execute("PRAGMA journal_mode = WAL;")
-                cursor.close()
+                try:
+                    cursor.execute("PRAGMA foreign_keys = ON;")
+                    cursor.execute(f"PRAGMA busy_timeout = {busy_timeout};")
+                finally:
+                    cursor.close()
 
         # Create asynchronous session factory
         self._session_factory = async_sessionmaker(
@@ -97,6 +96,11 @@ class DatabaseManager:
             expire_on_commit=False,
             autoflush=False,
         )
+
+        if "sqlite" in self.database_url and self.wal_enabled:
+            async with self._engine.connect() as connection:
+                await connection.exec_driver_sql("PRAGMA journal_mode = WAL;")
+                await connection.commit()
 
         # Verify connectivity
         await self.verify_connectivity()
@@ -132,4 +136,3 @@ class DatabaseManager:
             credentials, location = rest.split("@", 1)
             return f"{scheme}://***:***@{location}"
         return url
-
