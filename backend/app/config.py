@@ -2,6 +2,7 @@
 
 import os
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -183,6 +184,30 @@ class Settings:
         in ("true", "1", "yes")
     )
 
+    # External storage volume configuration
+    storage_mountpoint: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("DAILYDOCK_STORAGE_MOUNTPOINT", "/mnt/dailydock")
+        ).expanduser()
+    )
+    storage_volume_uuid: str = field(
+        default_factory=lambda: os.getenv("DAILYDOCK_STORAGE_VOLUME_UUID", "").strip()
+    )
+    storage_directory_name: str = field(
+        default_factory=lambda: os.getenv(
+            "DAILYDOCK_STORAGE_DIRECTORY_NAME", "dailydock"
+        )
+    )
+    storage_check_interval: float = field(
+        default_factory=lambda: float(
+            os.getenv("DAILYDOCK_STORAGE_CHECK_INTERVAL", "30")
+        )
+    )
+    storage_marker_path: Optional[str] = field(
+        default_factory=lambda: os.getenv("DAILYDOCK_STORAGE_MARKER_PATH", "").strip()
+        or None
+    )
+
     # Infrastructure monitoring configuration
     monitor_enabled: bool = field(
         default_factory=lambda: os.getenv("DAILYDOCK_MONITOR_ENABLED", "true").lower()
@@ -254,6 +279,7 @@ class Settings:
 
     def __post_init__(self) -> None:
         self.data_dir = _resolve_data_dir(self.data_dir)
+        self.storage_mountpoint = Path(self.storage_mountpoint).expanduser()
 
     def get_resolved_database_url(self) -> str:
         """Resolve database URL ensuring relative SQLite paths anchor to canonical data_dir."""
@@ -339,6 +365,42 @@ class Settings:
                 module="config",
                 context={"database_busy_timeout": self.database_busy_timeout},
             )
+
+        if not self.storage_mountpoint.is_absolute() or self.storage_mountpoint == Path("/"):
+            raise ConfigurationError(
+                "storage_mountpoint must be an absolute path other than '/'.",
+                module="config",
+            )
+        if not (0 < self.storage_check_interval <= 86400):
+            raise ConfigurationError(
+                "storage_check_interval must be between 0 and 86400 seconds.",
+                module="config",
+            )
+        if (
+            not self.storage_directory_name
+            or self.storage_directory_name in {".", ".."}
+            or Path(self.storage_directory_name).name != self.storage_directory_name
+        ):
+            raise ConfigurationError(
+                "storage_directory_name must be a single safe directory name.",
+                module="config",
+            )
+        if self.storage_volume_uuid and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.storage_volume_uuid
+        ):
+            raise ConfigurationError(
+                "storage_volume_uuid contains unsupported characters.",
+                module="config",
+            )
+        if self.storage_marker_path is not None:
+            marker = Path(self.storage_marker_path)
+            if not marker.parts or marker.is_absolute() or any(
+                part in {"", ".", ".."} for part in marker.parts
+            ):
+                raise ConfigurationError(
+                    "storage_marker_path must be a safe relative path.",
+                    module="config",
+                )
 
         intervals = {
             "monitor_system_interval": self.monitor_system_interval,

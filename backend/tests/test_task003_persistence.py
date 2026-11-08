@@ -307,6 +307,7 @@ async def test_lifespan_cleans_up_resources_after_startup_failure(
         "events.initialize",
         "modules.initialize",
         "modules.register:monitoring",
+        "modules.register:storage",
         "modules.startup",
         "modules.shutdown",
         "events.shutdown",
